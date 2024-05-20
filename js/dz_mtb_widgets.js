@@ -415,40 +415,40 @@ const DZ_widgets = {
   },
 
   setup: () => {
-    app.ui.settings.addSetting({
-      id: 'DZ.Debug.enabled',
-      name: '[DZ] Enable Debug (py and js)',
-      type: 'boolean',
-      defaultValue: false,
-
-      tooltip:
-        'This will enable debug messages in the console and in the python console respectively',
-      attrs: {
-        style: {
-          fontFamily: 'monospace',
-        },
-      },
-      async onChange(value) {
-        if (value) {
-          console.log('Enabled DEBUG mode')
-        }
-        if (!window.DZ) {
-          window.DZ = {}
-        }
-        window.DZ.DEBUG = value
-        await api
-          .fetchApi('/DZ/debug', {
-            method: 'POST',
-            body: JSON.stringify({
-              enabled: value,
-            }),
-          })
-          .then((response) => {})
-          .catch((error) => {
-            console.error('Error:', error)
-          })
-      },
-    })
+    // app.ui.settings.addSetting({
+    //   id: 'DZ.Debug.enabled',
+    //   name: '[DZ] Enable Debug (py and js)',
+    //   type: 'boolean',
+    //   defaultValue: false,
+    //
+    //   tooltip:
+    //     'This will enable debug messages in the console and in the python console respectively',
+    //   attrs: {
+    //     style: {
+    //       fontFamily: 'monospace',
+    //     },
+    //   },
+    //   async onChange(value) {
+    //     if (value) {
+    //       console.log('Enabled DEBUG mode')
+    //     }
+    //     if (!window.DZ) {
+    //       window.DZ = {}
+    //     }
+    //     window.DZ.DEBUG = value
+    //     await api
+    //       .fetchApi('/DZ/debug', {
+    //         method: 'POST',
+    //         body: JSON.stringify({
+    //           enabled: value,
+    //         }),
+    //       })
+    //       .then((response) => {})
+    //       .catch((error) => {
+    //         console.error('Error:', error)
+    //       })
+    //   },
+    // })
   },
 
   getCustomWidgets: function () {
