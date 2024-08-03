@@ -9,7 +9,7 @@ class PromptEmbellish:
 
     @classmethod
     def INPUT_TYPES(self):
-        api_list = ['google-gemini']
+        api_list = ['gemini-1.5-flash', 'gemini-pro-vision']
         return {
             "required": {
                 "api": (api_list,),
@@ -24,7 +24,7 @@ class PromptEmbellish:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("text",)
     FUNCTION = 'prompt_embellish'
-    CATEGORY = '😺dzNodes/LayerUtility'
+    CATEGORY = '😺dzNodes/LayerUtility/Prompt'
 
     def prompt_embellish(self, api, token_limit, describe, image=None):
         if describe == "" and image is None:
@@ -77,10 +77,10 @@ class PromptEmbellish:
                                       f"Only respond with the prompt itself, but embellish it."
                                       )
             _image = tensor2pil(image).convert('RGB')
-            model = genai.GenerativeModel('gemini-pro-vision',
+            model = genai.GenerativeModel(api,
                                           generation_config=gemini_generate_config,
                                           safety_settings=gemini_safety_settings)
-            log(f"{NODE_NAME}: Request to gemini-pro-vision...")
+            log(f"{NODE_NAME}: Request to {api}...")
             response = model.generate_content([second_step_prompt, _image])
             print(response)
             ret_text = response.text

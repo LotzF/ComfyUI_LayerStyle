@@ -14,8 +14,8 @@ class ImageScaleByAspectRatioV2:
         ratio_list = ['original', 'custom', '1:1', '3:2', '4:3', '16:9', '2:3', '3:4', '9:16']
         fit_mode = ['letterbox', 'crop', 'fill']
         method_mode = ['lanczos', 'bicubic', 'hamming', 'bilinear', 'box', 'nearest']
-        multiple_list = ['8', '16', '32', '64', 'None']
-        scale_to_list = ['None', 'longest', 'shortest']
+        multiple_list = ['8', '16', '32', '64', '128', '256', '512', 'None']
+        scale_to_list = ['None', 'longest', 'shortest', 'width', 'height', 'total_pixel(kilo pixel)']
         return {
             "required": {
                 "aspect_ratio": (ratio_list,),
@@ -26,6 +26,7 @@ class ImageScaleByAspectRatioV2:
                 "round_to_multiple": (multiple_list,),
                 "scale_to_side": (scale_to_list,),  # 是否按长边缩放
                 "scale_to_length": ("INT", {"default": 1024, "min": 4, "max": 999999, "step": 1}),
+                "background_color": ("STRING", {"default": "#000000"}),  # 背景颜色
             },
             "optional": {
                 "image": ("IMAGE",),  #
@@ -40,6 +41,7 @@ class ImageScaleByAspectRatioV2:
 
     def image_scale_by_aspect_ratio(self, aspect_ratio, proportional_width, proportional_height,
                                     fit, method, round_to_multiple, scale_to_side, scale_to_length,
+                                    background_color,
                                     image=None, mask = None,
                                     ):
         orig_images = []
@@ -83,13 +85,24 @@ class ImageScaleByAspectRatioV2:
             ratio = int(s[0]) / int(s[1])
 
         # calculate target width and height
-        if orig_width > orig_height:
+        if ratio > 1:
             if scale_to_side == 'longest':
                 target_width = scale_to_length
                 target_height = int(target_width / ratio)
             elif scale_to_side == 'shortest':
                 target_height = scale_to_length
                 target_width = int(target_height * ratio)
+            elif scale_to_side == 'width':
+                target_width = scale_to_length
+                target_height = int(target_width / ratio)
+            elif scale_to_side == 'height':
+                target_height = scale_to_length
+                target_width = int(target_height * ratio)
+            elif scale_to_side == 'total_pixel(kilo pixel)':
+                target_width = math.sqrt(ratio * scale_to_length * 1000)
+                target_height = target_width / ratio
+                target_width = int(target_width)
+                target_height = int(target_height)
             else:
                 target_width = orig_width
                 target_height = int(target_width / ratio)
@@ -100,14 +113,25 @@ class ImageScaleByAspectRatioV2:
             elif scale_to_side == 'shortest':
                 target_width = scale_to_length
                 target_height = int(target_width / ratio)
+            elif scale_to_side == 'width':
+                target_width = scale_to_length
+                target_height = int(target_width / ratio)
+            elif scale_to_side == 'height':
+                target_height = scale_to_length
+                target_width = int(target_height * ratio)
+            elif scale_to_side == 'total_pixel(kilo pixel)':
+                target_width = math.sqrt(ratio * scale_to_length * 1000)
+                target_height = target_width / ratio
+                target_width = int(target_width)
+                target_height = int(target_height)
             else:
                 target_height = orig_height
                 target_width = int(target_height * ratio)
 
         if round_to_multiple != 'None':
             multiple = int(round_to_multiple)
-            target_width = num_round_to_multiple(target_width, multiple)
-            target_height = num_round_to_multiple(target_height, multiple)
+            target_width = num_round_up_to_multiple(target_width, multiple)
+            target_height = num_round_up_to_multiple(target_height, multiple)
 
         _mask = Image.new('L', size=(target_width, target_height), color='black')
         _image = Image.new('RGB', size=(target_width, target_height), color='black')
@@ -127,7 +151,7 @@ class ImageScaleByAspectRatioV2:
         if len(orig_images) > 0:
             for i in orig_images:
                 _image = tensor2pil(i).convert('RGB')
-                _image = fit_resize_image(_image, target_width, target_height, fit, resize_sampler)
+                _image = fit_resize_image(_image, target_width, target_height, fit, resize_sampler, background_color)
                 ret_images.append(pil2tensor(_image))
         if len(orig_masks) > 0:
             for m in orig_masks:

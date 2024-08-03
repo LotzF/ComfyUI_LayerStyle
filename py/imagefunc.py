@@ -22,6 +22,7 @@ import scipy.ndimage
 import cv2
 import random
 import time
+from pathlib import Path
 from tqdm import tqdm
 from functools import lru_cache
 from typing import Union, List
@@ -29,6 +30,7 @@ from PIL import Image, ImageFilter, ImageChops, ImageDraw, ImageOps, ImageEnhanc
 from skimage import img_as_float, img_as_ubyte
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
+from transformers import AutoModel, AutoProcessor, StoppingCriteria, StoppingCriteriaList, AutoModelForCausalLM
 import colorsys
 from typing import Union
 import folder_paths
@@ -36,6 +38,7 @@ from .briarmbg import BriaRMBG
 from .filmgrainer import processing as processing_utils
 from .filmgrainer import filmgrainer as filmgrainer
 import wget
+import gc
 
 from .blendmodes import *
 
@@ -446,6 +449,56 @@ def vignette_image(image:Image, intensity: float, center_x: float, center_y: flo
     vignette_image = __apply_vignette(tensor_image, vignette)
     return tensor2pil(torch.from_numpy(vignette_image).unsqueeze(0))
 
+def RGB2YCbCr(t):
+    YCbCr = t.detach().clone()
+    YCbCr[:,:,:,0] = 0.2123 * t[:,:,:,0] + 0.7152 * t[:,:,:,1] + 0.0722 * t[:,:,:,2]
+    YCbCr[:,:,:,1] = 0 - 0.1146 * t[:,:,:,0] - 0.3854 * t[:,:,:,1] + 0.5 * t[:,:,:,2]
+    YCbCr[:,:,:,2] = 0.5 * t[:,:,:,0] - 0.4542 * t[:,:,:,1] - 0.0458 * t[:,:,:,2]
+    return YCbCr
+
+def YCbCr2RGB(t):
+    RGB = t.detach().clone()
+    RGB[:,:,:,0] = t[:,:,:,0] + 1.5748 * t[:,:,:,2]
+    RGB[:,:,:,1] = t[:,:,:,0] - 0.1873 * t[:,:,:,1] - 0.4681 * t[:,:,:,2]
+    RGB[:,:,:,2] = t[:,:,:,0] + 1.8556 * t[:,:,:,1]
+    return RGB
+
+# gaussian blur a tensor image batch in format [B x H x W x C] on H/W (spatial, per-image, per-channel)
+def cv_blur_tensor(images, dx, dy):
+    if min(dx, dy) > 100:
+        np_img = torch.nn.functional.interpolate(images.detach().clone().movedim(-1,1), scale_factor=0.1, mode='bilinear').movedim(1,-1).cpu().numpy()
+        for index, image in enumerate(np_img):
+            np_img[index] = cv2.GaussianBlur(image, (dx // 20 * 2 + 1, dy // 20 * 2 + 1), 0)
+        return torch.nn.functional.interpolate(torch.from_numpy(np_img).movedim(-1,1), size=(images.shape[1], images.shape[2]), mode='bilinear').movedim(1,-1)
+    else:
+        np_img = images.detach().clone().cpu().numpy()
+        for index, image in enumerate(np_img):
+            np_img[index] = cv2.GaussianBlur(image, (dx, dy), 0)
+        return torch.from_numpy(np_img)
+
+def image_add_grain(image:Image, scale:float=0.5, strength:float=0.5, saturation:float=0.7, toe:float=0.0, seed:int=0) -> Image:
+
+    image = pil2tensor(image.convert("RGB"))
+    t = image.detach().clone()
+    torch.manual_seed(seed)
+    grain = torch.rand(t.shape[0], int(t.shape[1] // scale), int(t.shape[2] // scale), 3)
+
+    YCbCr = RGB2YCbCr(grain)
+    YCbCr[:, :, :, 0] = cv_blur_tensor(YCbCr[:, :, :, 0], 3, 3)
+    YCbCr[:, :, :, 1] = cv_blur_tensor(YCbCr[:, :, :, 1], 15, 15)
+    YCbCr[:, :, :, 2] = cv_blur_tensor(YCbCr[:, :, :, 2], 11, 11)
+
+    grain = (YCbCr2RGB(YCbCr) - 0.5) * strength
+    grain[:, :, :, 0] *= 2
+    grain[:, :, :, 2] *= 3
+    grain += 1
+    grain = grain * saturation + grain[:, :, :, 1].unsqueeze(3).repeat(1, 1, 1, 3) * (1 - saturation)
+
+    grain = torch.nn.functional.interpolate(grain.movedim(-1, 1), size=(t.shape[1], t.shape[2]),
+                                            mode='bilinear').movedim(1, -1)
+    t[:, :, :, :3] = torch.clip((1 - (1 - t[:, :, :, :3]) * grain) * (1 - toe) + toe, 0, 1)
+    return tensor2pil(t)
+
 def filmgrain_image(image:Image, scale:float, grain_power:float,
                     shadows:float, highs:float, grain_sat:float,
                     sharpen:int=1, grain_type:int=4, src_gamma:float=1.0,
@@ -607,7 +660,7 @@ def image_rotate_extend_with_alpha(image:Image, angle:float, alpha:Image=None, m
         ret_image = RGB2RGBA(_image, _alpha)
     else:
         ret_image = _image
-    return (_image, _alpha, ret_image)
+    return (_image, _alpha.convert('L'), ret_image)
 
 def create_box_gradient(start_color_inhex:str, end_color_inhex:str, width:int, height:int, scale:int=50) -> Image:
     # scale is percent of border to center for the rectangle
@@ -626,7 +679,6 @@ def create_box_gradient(start_color_inhex:str, end_color_inhex:str, width:int, h
             G = int(start_color[1] * (step - i) / step + end_color[1] * i / step)
             B = int(start_color[2] * (step - i) / step + end_color[2] * i / step)
             color = (R, G, B)
-            log(f"step={step},i={i}, color={color}")
             draw.rectangle((i, i, width - i, height - i), fill=color)
     draw.rectangle((step, step, width - step, height - step), fill=end_color)
     return ret_image
@@ -844,12 +896,22 @@ def adjust_levels(image:Image, input_black:int=0, input_white:int=255, midtones:
     img = img.astype(np.uint8)
     return cv22pil(img)
 
-
-def get_image_color_tone(image:Image) -> str:
+def get_image_color_tone(image:Image, mask:Image=None) -> str:
     image = image.convert('RGB')
     max_score = 0.0001
     dominant_color = (255, 255, 255)
-    for count, (r, g, b) in image.getcolors(image.width * image.height):
+    if mask is not None:
+        if mask.mode != 'L':
+            mask = mask.convert('L')
+        canvas = Image.new('RGB', size=image.size, color='black')
+        canvas.paste(image, mask=mask)
+        image = canvas
+
+    all_colors = image.getcolors(image.width * image.height)
+    for count, (r, g, b) in all_colors:
+        if mask is not None:
+            if r + g + b < 2:  # 忽略黑色
+                continue
         saturation = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)[1]
         y = min(abs(r * 2104 + g * 4130 + b * 802 + 4096 + 131072) >> 13,235)
         y = (y - 16.0) / (235 - 16)
@@ -860,22 +922,29 @@ def get_image_color_tone(image:Image) -> str:
     ret_color = RGB_to_Hex(dominant_color)
     return ret_color
 
-def get_image_color_average(image:Image) -> str:
+def get_image_color_average(image:Image, mask:Image=None) -> str:
     image = image.convert('RGB')
     width, height = image.size
     total_red = 0
     total_green = 0
     total_blue = 0
+    total_pixel =0
     for y in range(height):
         for x in range(width):
+            if mask is not None:
+                if mask.mode != 'L':
+                    mask = mask.convert('L')
+                if mask.getpixel((x, y)) <= 127:
+                    continue
             rgb = image.getpixel((x, y))
             total_red += rgb[0]
             total_green += rgb[1]
             total_blue += rgb[2]
+            total_pixel += 1
 
-    average_red = total_red // (width * height)
-    average_green = total_green // (width * height)
-    average_blue = total_blue // (width * height)
+    average_red = total_red // total_pixel
+    average_green = total_green // total_pixel
+    average_blue = total_blue // total_pixel
     color = (average_red, average_green, average_blue)
     ret_color = RGB_to_Hex(color)
     return ret_color
@@ -1028,29 +1097,56 @@ def gamma_trans(image:Image, gamma:float) -> Image:
     _corrected = cv2.LUT(cv2_image,gamma_table)
     return cv22pil(_corrected)
 
-def apply_lut(image:Image, lut_file:str, log:bool=False) -> Image:
-    from colour.io.luts.iridas_cube import read_LUT_IridasCube, LUT3D, LUT3x1D
-    lut: Union[LUT3x1D, LUT3D] = read_LUT_IridasCube(lut_file)
-    lut.name = os.path.splitext(os.path.basename(lut_file))[0]  # use base filename instead of internal LUT name
+def apply_lut(image:Image, lut_file:str, colorspace:str, strength:int, clip_values:bool=True) -> Image:
+    """
+    Apply a LUT to an image.
+    :param image: Image to apply the LUT to.
+    :param lut_file: LUT file to apply.
+    :param colorspace: Colorspace to convert the image to before applying the LUT.
+    :param clip_values: Clip the values of the LUT to the domain of the LUT.
+    :param strength: Strength of the LUT.
+    :return: Image with the LUT applied.
+    """
+    log_colorspace = False
+    if colorspace == "log":
+        log_colorspace = True
 
-    im_array = np.asarray(image.convert('RGB'), dtype=np.float32) / 255
+    from colour.io.luts.iridas_cube import read_LUT_IridasCube
+
+    lut = read_LUT_IridasCube(lut_file)
+    lut.name = lut_file
+
+    if clip_values:
+        if lut.domain[0].max() == lut.domain[0].min() and lut.domain[1].max() == lut.domain[1].min():
+            lut.table = np.clip(lut.table, lut.domain[0, 0], lut.domain[1, 0])
+        else:
+            if len(lut.table.shape) == 2:  # 3x1D
+                for dim in range(3):
+                    lut.table[:, dim] = np.clip(lut.table[:, dim], lut.domain[0, dim], lut.domain[1, dim])
+            else:  # 3D
+                for dim in range(3):
+                    lut.table[:, :, :, dim] = np.clip(lut.table[:, :, :, dim], lut.domain[0, dim], lut.domain[1, dim])
+
+    img = pil2tensor(image)
+    lut_img = img.numpy().copy()
     is_non_default_domain = not np.array_equal(lut.domain, np.array([[0., 0., 0.], [1., 1., 1.]]))
     dom_scale = None
     if is_non_default_domain:
         dom_scale = lut.domain[1] - lut.domain[0]
-        im_array = im_array * dom_scale + lut.domain[0]
-    if log:
-        im_array = im_array ** (1 / 2.2)
-    im_array = lut.apply(im_array)
-    if log:
-        im_array = im_array ** (2.2)
+        lut_img = lut_img * dom_scale + lut.domain[0]
+    if log_colorspace:
+        lut_img = lut_img ** (1/2.2)
+    lut_img = lut.apply(lut_img)
+    if log_colorspace:
+        lut_img = lut_img ** (2.2)
     if is_non_default_domain:
-        im_array = (im_array - lut.domain[0]) / dom_scale
-    im_array = im_array * 255
-    ret_image = Image.fromarray(np.uint8(im_array))
+        lut_img = (lut_img - lut.domain[0]) / dom_scale
+    lut_img = torch.from_numpy(lut_img)
+    if strength < 100:
+        strength /= 100
+        lut_img = strength * lut_img + (1 - strength) * img
 
-    return ret_image
-
+    return tensor2pil(lut_img)
 
 def color_adapter(image:Image, ref_image:Image) -> Image:
     image = pil2cv2(image)
@@ -1162,8 +1258,141 @@ def generate_text_image(text:str, font_path:str, font_size:int, text_color:str="
             index += 1
     return (image.convert('RGB'), image.split()[3])
 
+def watermark_image_size(image:Image) -> int:
+    size = int(math.sqrt(image.width * image.height * 0.015625) * 0.9)
+    return size
+
+def add_invisibal_watermark(image:Image, watermark_image:Image) -> Image:
+    """
+    Adds an invisible watermark to an image.
+    """
+    orig_image_mode = image.mode
+    temp_dir = os.path.join(folder_paths.get_temp_directory(), generate_random_name('_watermark_', '_temp', 16))
+    if os.path.isdir(temp_dir):
+        shutil.rmtree(temp_dir)
+    image_dir = os.path.join(temp_dir, 'image')
+    wm_dir = os.path.join(temp_dir, 'wm')
+    result_dir = os.path.join(temp_dir, 'result')
+
+    try:
+        os.makedirs(image_dir)
+        os.makedirs(wm_dir)
+        os.makedirs(result_dir)
+    except Exception as e:
+        print(e)
+        log(f"Error: {NODE_NAME} skipped, because unable to create temporary folder.", message_type='error')
+        return (image,)
+
+    image_file_name = os.path.join(generate_random_name('watermark_orig_', '_temp', 16) + '.png')
+    wm_file_name = os.path.join(generate_random_name('watermark_image_', '_temp', 16) + '.png')
+    output_file_name = os.path.join(generate_random_name('watermark_output_', '_temp', 16) + '.png')
+
+    try:
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        image.save(os.path.join(image_dir, image_file_name))
+        watermark_image.save(os.path.join(wm_dir, wm_file_name))
+    except IOError as e:
+        print(e)
+        log(f"Error: {NODE_NAME} skipped, because unable to create temporary file.", message_type='error')
+        return (image,)
+
+    from blind_watermark import WaterMark
+    bwm1 = WaterMark(password_img=1, password_wm=1)
+    bwm1.read_img(os.path.join(image_dir, image_file_name))
+    bwm1.read_wm(os.path.join(wm_dir, wm_file_name))
+    output_image = os.path.join(result_dir, output_file_name)
+    bwm1.embed(output_image, compression_ratio=100)
+
+    return Image.open(output_image).convert(orig_image_mode)
+
+def decode_watermark(image:Image, watermark_image_size:int=94) -> Image:
+    temp_dir = os.path.join(folder_paths.get_temp_directory(), generate_random_name('_watermark_', '_temp', 16))
+    if os.path.isdir(temp_dir):
+        shutil.rmtree(temp_dir)
+    image_dir = os.path.join(temp_dir, 'decode_image')
+    result_dir = os.path.join(temp_dir, 'decode_result')
+
+    try:
+        os.makedirs(image_dir)
+        os.makedirs(result_dir)
+    except Exception as e:
+        print(e)
+        log(f"Error: {NODE_NAME} skipped, because unable to create temporary folder.", message_type='error')
+        return (image,)
+
+    image_file_name = os.path.join(generate_random_name('watermark_decode_', '_temp', 16) + '.png')
+    output_file_name = os.path.join(generate_random_name('watermark_decode_output_', '_temp', 16) + '.png')
+
+    try:
+        image.save(os.path.join(image_dir, image_file_name))
+    except IOError as e:
+        print(e)
+        log(f"Error: {NODE_NAME} skipped, because unable to create temporary file.", message_type='error')
+        return (image,)
+
+    from blind_watermark import WaterMark
+    bwm1 = WaterMark(password_img=1, password_wm=1)
+    decode_image = os.path.join(image_dir, image_file_name)
+    output_image = os.path.join(result_dir, output_file_name)
+
+    try:
+        bwm1.extract(filename=decode_image, wm_shape=(watermark_image_size, watermark_image_size),
+                     out_wm_name=os.path.join(output_image),)
+        ret_image = Image.open(output_image)
+    except Exception as e:
+        log(f"blind watermark extract fail, {e}")
+        ret_image = Image.new("RGB", (64, 64), color="black")
+    ret_image = normalize_gray(ret_image)
+    return ret_image
+
+def generate_text_image(width:int, height:int, text:str, font_file:str, text_scale:float=1, font_color:str="#FFFFFF",) -> Image:
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    font_size = int(width / len(text) * text_scale)
+    font = ImageFont.truetype(font_file, font_size)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width, text_height = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = int((width - text_width) / 2)
+    y = int((height - text_height) / 2) - int(font_size / 2)
+    draw.text((x, y), text, font=font, fill=font_color)
+    return image
 
 '''Mask Functions'''
+
+def create_mask_from_color_cv2(image:Image, color:str, tolerance:int=0) -> Image:
+    (r, g, b) = Hex_to_RGB(color)
+    target_color = (b, g, r)
+    tolerance = 127 + int(tolerance * 1.28)
+    # tolerance = 255 - tolerance
+    # 将RGB颜色转换为HSV颜色空间
+    image = pil2cv2(image)
+    hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    # 定义目标颜色的HSV范围
+    lower_color = np.array([max(target_color[0] - tolerance, 0), max(target_color[1] - tolerance, 0), max(target_color[2] - tolerance, 0)])
+    upper_color = np.array([min(target_color[0] + tolerance, 255), min(target_color[1] + tolerance, 255), min(target_color[2] + tolerance, 255)])
+
+    # 创建掩码
+    mask = cv2.inRange(hsv_image, lower_color, upper_color)
+
+    return cv22pil(mask).convert("L")
+
+def create_mask_from_color_tensor(image:Image, color:str, tolerance:int=0) -> Image:
+    threshold = int(tolerance * 1.28)
+    (red, green, blue) = Hex_to_RGB(color)
+    image = pil2tensor(image).squeeze()
+    temp = (torch.clamp(image, 0, 1.0) * 255.0).round().to(torch.int)
+    color_value = torch.tensor([red, green, blue])
+    lower_bound = (color_value - threshold).clamp(min=0)
+    upper_bound = (color_value + threshold).clamp(max=255)
+    lower_bound = lower_bound.view(1, 1, 1, 3)
+    upper_bound = upper_bound.view(1, 1, 1, 3)
+    mask = (temp >= lower_bound) & (temp <= upper_bound)
+    mask = mask.all(dim=-1)
+    mask = mask.float()
+    return tensor2pil(mask).convert("L")
+
 @lru_cache(maxsize=1, typed=False)
 def load_RMBG_model():
     current_directory = os.path.dirname(os.path.abspath(__file__))
@@ -1183,6 +1412,7 @@ def load_RMBG_model():
     net.eval()
     return net
 
+
 def RMBG(image:Image) -> Image:
     rmbgmodel = load_RMBG_model()
     w, h = image.size
@@ -1201,50 +1431,114 @@ def RMBG(image:Image) -> Image:
     _mask = torch.from_numpy(np.squeeze(im_array).astype(np.float32))
     return tensor2pil(_mask)
 
+def guided_filter_alpha(image:torch.Tensor, mask:torch.Tensor, filter_radius:int) -> torch.Tensor:
+    sigma = 0.15
+    d = filter_radius + 1
+    mask = pil2tensor(tensor2pil(mask).convert('RGB'))
+    if not bool(d % 2):
+        d += 1
+    s = sigma / 10
+    i_dup = copy.deepcopy(image.cpu().numpy())
+    a_dup = copy.deepcopy(mask.cpu().numpy())
+    for index, image in enumerate(i_dup):
+        alpha_work = a_dup[index]
+        i_dup[index] = guidedFilter(image, alpha_work, d, s)
+    return torch.from_numpy(i_dup)
+
+#pymatting edge detail
+def mask_edge_detail(image:torch.Tensor, mask:torch.Tensor, detail_range:int=8, black_point:float=0.01, white_point:float=0.99) -> torch.Tensor:
+    from pymatting import fix_trimap, estimate_alpha_cf
+    d = detail_range * 5 + 1
+    mask = pil2tensor(tensor2pil(mask).convert('RGB'))
+    if not bool(d % 2):
+        d += 1
+    i_dup = copy.deepcopy(image.cpu().numpy().astype(np.float64))
+    a_dup = copy.deepcopy(mask.cpu().numpy().astype(np.float64))
+    for index, img in enumerate(i_dup):
+        trimap = a_dup[index][:, :, 0]  # convert to single channel
+        if detail_range > 0:
+            trimap = cv2.GaussianBlur(trimap, (d, d), 0)
+        trimap = fix_trimap(trimap, black_point, white_point)
+        alpha = estimate_alpha_cf(img, trimap, laplacian_kwargs={"epsilon": 1e-6},
+                                  cg_kwargs={"maxiter": 500})
+        a_dup[index] = np.stack([alpha, alpha, alpha], axis=-1)  # convert back to rgb
+    return torch.from_numpy(a_dup.astype(np.float32))
+
 class VITMatteModel:
     def __init__(self,model,processor):
         self.model = model
         self.processor = processor
 
 def load_VITMatte_model(model_name:str, local_files_only:bool=False) -> object:
+    # if local_files_only:
+    #     model_name = Path(os.path.join(folder_paths.models_dir, "vitmatte"))
+    model_name = Path(os.path.join(folder_paths.models_dir, "vitmatte"))
     from transformers import VitMatteImageProcessor, VitMatteForImageMatting
     model = VitMatteForImageMatting.from_pretrained(model_name, local_files_only=local_files_only)
     processor = VitMatteImageProcessor.from_pretrained(model_name, local_files_only=local_files_only)
     vitmatte = VITMatteModel(model, processor)
     return vitmatte
 
-def generate_VITMatte(image:Image, trimap:Image, local_files_only:bool=False) -> Image:
+def generate_VITMatte(image:Image, trimap:Image, local_files_only:bool=False, device:str="cpu", max_megapixels:float=2.0) -> Image:
     if image.mode != 'RGB':
         image = image.convert('RGB')
     if trimap.mode != 'L':
         trimap = trimap.convert('L')
+    max_megapixels *= 1048576
+    width, height = image.size
+    ratio = width / height
+    target_width = math.sqrt(ratio * max_megapixels)
+    target_height = target_width / ratio
+    target_width = int(target_width)
+    target_height = int(target_height)
+    if width * height > max_megapixels:
+        image = image.resize((target_width, target_height), Image.BILINEAR)
+        trimap = trimap.resize((target_width, target_height), Image.BILINEAR)
+        log(f"vitmatte image size {width}x{height} too large, resize to {target_width}x{target_height} for processing.")
     model_name = "hustvl/vitmatte-small-composition-1k"
+    if device=="cpu":
+        device = torch.device('cpu')
+    else:
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            log("vitmatte device is set to cuda, but not available, using cpu instead.")
+            device = torch.device('cpu')
     vit_matte_model = load_VITMatte_model(model_name=model_name, local_files_only=local_files_only)
+    vit_matte_model.model.to(device)
+    log(f"vitmatte processing, image size = {image.width}x{image.height}, device = {device}.")
     inputs = vit_matte_model.processor(images=image, trimaps=trimap, return_tensors="pt")
     with torch.no_grad():
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         predictions = vit_matte_model.model(**inputs).alphas
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
     mask = tensor2pil(predictions).convert('L')
     mask = mask.crop(
         (0, 0, image.width, image.height))  # remove padding that the prediction appends (works in 32px tiles)
+    if width * height > max_megapixels:
+        mask = mask.resize((width, height), Image.BILINEAR)
     return mask
 
 def generate_VITMatte_trimap(mask:torch.Tensor, erode_kernel_size:int, dilate_kernel_size:int) -> Image:
+    def g_trimap(mask, erode_kernel_size=10, dilate_kernel_size=10):
+        erode_kernel = np.ones((erode_kernel_size, erode_kernel_size), np.uint8)
+        dilate_kernel = np.ones((dilate_kernel_size, dilate_kernel_size), np.uint8)
+        eroded = cv2.erode(mask, erode_kernel, iterations=5)
+        dilated = cv2.dilate(mask, dilate_kernel, iterations=5)
+        trimap = np.zeros_like(mask)
+        trimap[dilated == 255] = 128
+        trimap[eroded == 255] = 255
+        return trimap
+
     mask = mask.squeeze(0).cpu().detach().numpy().astype(np.uint8) * 255
-    trimap = __generate_trimap(mask, erode_kernel_size, dilate_kernel_size).astype(np.float32)
+    trimap = g_trimap(mask, erode_kernel_size, dilate_kernel_size).astype(np.float32)
     trimap[trimap == 128] = 0.5
     trimap[trimap == 255] = 1
     trimap = torch.from_numpy(trimap).unsqueeze(0)
-    return tensor2pil(trimap).convert('L')
 
-def __generate_trimap(mask, erode_kernel_size=10, dilate_kernel_size=10):
-    erode_kernel = np.ones((erode_kernel_size, erode_kernel_size), np.uint8)
-    dilate_kernel = np.ones((dilate_kernel_size, dilate_kernel_size), np.uint8)
-    eroded = cv2.erode(mask, erode_kernel, iterations=5)
-    dilated = cv2.dilate(mask, dilate_kernel, iterations=5)
-    trimap = np.zeros_like(mask)
-    trimap[dilated == 255] = 128
-    trimap[eroded == 255] = 255
-    return trimap
+    return tensor2pil(trimap).convert('L')
 
 
 def get_a_person_mask_generator_model_path() -> str:
@@ -1265,38 +1559,6 @@ def get_a_person_mask_generator_model_path() -> str:
         os.makedirs(model_file_path, exist_ok=True)
         wget.download(model_url, model_file_path)
     return model_file_path
-
-def mask_edge_detail(image:torch.Tensor, mask:torch.Tensor, detail_range:int=8, black_point:float=0.01, white_point:float=0.99) -> torch.Tensor:
-    from pymatting import fix_trimap, estimate_alpha_cf
-    d = detail_range * 5 + 1
-    mask = pil2tensor(tensor2pil(mask).convert('RGB'))
-    if not bool(d % 2):
-        d += 1
-    i_dup = copy.deepcopy(image.cpu().numpy().astype(np.float64))
-    a_dup = copy.deepcopy(mask.cpu().numpy().astype(np.float64))
-    for index, img in enumerate(i_dup):
-        trimap = a_dup[index][:, :, 0]  # convert to single channel
-        if detail_range > 0:
-            trimap = cv2.GaussianBlur(trimap, (d, d), 0)
-        trimap = fix_trimap(trimap, black_point, white_point)
-        alpha = estimate_alpha_cf(img, trimap, laplacian_kwargs={"epsilon": 1e-6},
-                                  cg_kwargs={"maxiter": 500})
-        a_dup[index] = np.stack([alpha, alpha, alpha], axis=-1)  # convert back to rgb
-    return torch.from_numpy(a_dup.astype(np.float32))
-
-def guided_filter_alpha(image:torch.Tensor, mask:torch.Tensor, filter_radius:int) -> torch.Tensor:
-    sigma = 0.15
-    d = filter_radius + 1
-    mask = pil2tensor(tensor2pil(mask).convert('RGB'))
-    if not bool(d % 2):
-        d += 1
-    s = sigma / 10
-    i_dup = copy.deepcopy(image.cpu().numpy())
-    a_dup = copy.deepcopy(mask.cpu().numpy())
-    for index, image in enumerate(i_dup):
-        alpha_work = a_dup[index]
-        i_dup[index] = guidedFilter(image, alpha_work, d, s)
-    return torch.from_numpy(i_dup)
 
 def mask_fix(images:torch.Tensor, radius:int, fill_holes:int, white_threshold:float, extra_clip:float) -> torch.Tensor:
     d = radius * 2 + 1
@@ -1447,6 +1709,18 @@ def gray_threshold(image:Image, thresh:int=127, otsu:bool=False) -> Image:
 def image_to_colormap(image:Image, index:int) -> Image:
     return cv22pil(cv2.applyColorMap(pil2cv2(image), index))
 
+# 检查mask有效区域面积比例
+def mask_white_area(mask:Image, white_point:int) -> float:
+    if mask.mode != 'L':
+        mask.convert('L')
+    white_pixels = 0
+    for y in range(mask.height):
+        for x in range(mask.width):
+            mask.getpixel((x, y)) > 16
+            if mask.getpixel((x, y)) > white_point:
+                white_pixels += 1
+    return white_pixels / (mask.width * mask.height)
+
 '''Color Functions'''
 
 
@@ -1525,6 +1799,21 @@ def Hex_to_HSV_255level(inhex:str) -> list:
         HSV = colorsys.rgb_to_hsv(RGB[0] / 255.0, RGB[1] / 255.0, RGB[2] / 255.0)
     return [int(x * 255) for x in HSV]
 
+
+def HSV_255level_to_Hex(HSV: list) -> str:
+    if len(HSV) != 3 or any((not isinstance(v, int) or v < 0 or v > 255) for v in HSV):
+        raise ValueError('Invalid HSV values, each value should be an integer between 0 and 255')
+
+    H, S, V = HSV
+    RGB = tuple(int(x * 255) for x in hsv_to_rgb(H / 255.0, S / 255.0, V / 255.0))
+
+    # Convert RGB values to hexadecimal format
+    hex_r = format(RGB[0], '02x')
+    hex_g = format(RGB[1], '02x')
+    hex_b = format(RGB[2], '02x')
+
+    return '#' + hex_r + hex_g + hex_b
+
 '''Value Functions'''
 
 def step_value(start_value, end_value, total_step, step) -> float:  # 按当前步数在总步数中的位置返回比例值
@@ -1567,6 +1856,7 @@ def random_numbers(total:int, random_range:int, seed:int=0, sum_of_numbers:int=0
     ret_list.append((sum_of_numbers - sum(ret_list)) // 2)
     return ret_list
 
+# 四舍五入取整数倍
 def num_round_to_multiple(number:int, multiple:int) -> int:
     remainder = number % multiple
     if remainder == 0 :
@@ -1575,6 +1865,15 @@ def num_round_to_multiple(number:int, multiple:int) -> int:
         factor = int(number / multiple)
         if number - factor * multiple > multiple / 2:
             factor += 1
+        return factor * multiple
+
+# 向上取整数倍
+def num_round_up_to_multiple(number: int, multiple: int) -> int:
+    remainder = number % multiple
+    if remainder == 0:
+        return number
+    else:
+        factor = (number + multiple - 1) // multiple  # 向上取整的计算方式
         return factor * multiple
 
 def calculate_side_by_ratio(orig_width:int, orig_height:int, ratio:float, longest_side:int=0) -> int:
@@ -1628,6 +1927,39 @@ def is_contain_chinese(check_str:str) -> bool:
             return True
     return False
 
+# 提取字符串中的int数为列表
+def extract_numbers(string):
+    return [int(s) for s in re.findall(r'\d+', string)]
+
+# 提取字符串中的数值, 返回为列表
+def extract_all_numbers_from_str(string, checkint:bool=False):
+    # 定义浮点数的正则表达式模式
+    number_pattern = r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?'
+    # 使用re.findall找到所有匹配的字符串
+    matches = re.findall(number_pattern, string)
+    # 转换为浮点数
+    numbers = [float(match) for match in matches]
+    number_list = []
+    # 如果需要检查是否为整数，则将浮点数转换为整数
+    if checkint:
+        for num in numbers:
+            int_num = int(num)
+            if math.isclose(num, int_num, rel_tol=1e-19):
+                number_list.append(int_num)
+            else:
+                number_list.append(num)
+    else:
+        number_list = numbers
+
+    return number_list
+
+def clear_memory():
+    # Cleanup
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
 def tensor_info(tensor:object) -> str:
     value = ''
     if isinstance(tensor, torch.Tensor):
@@ -1642,10 +1974,97 @@ def tensor_info(tensor:object) -> str:
         value = f"tensor_info: Not tensor, type is {type(tensor)}"
     return value
 
+# 去除重复的句子
+def remove_duplicate_string(text:str) -> str:
+    sentences = re.split(r'(?<=[:;,.!?])\s+', text)
+    unique_sentences = []
+    seen = set()
+    for sentence in sentences:
+        if sentence not in seen:
+            seen.add(sentence)
+            unique_sentences.append(sentence)
+    return ' '.join(unique_sentences)
+
+files_for_uform_gen2_qwen = Path(os.path.join(folder_paths.models_dir, "LLavacheckpoints", "files_for_uform_gen2_qwen"))
+class StopOnTokens(StoppingCriteria):
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        stop_ids = [151645]  # Define stop tokens as per your model's specifics
+        for stop_id in stop_ids:
+            if input_ids[0][-1] == stop_id:
+                return True
+        return False
+
+class UformGen2QwenChat:
+    def __init__(self):
+        from huggingface_hub import snapshot_download
+        # self.model_path = snapshot_download("unum-cloud/uform-gen2-qwen-500m",
+        #                                     local_dir=files_for_uform_gen2_qwen,
+        #                                     force_download=False,  # Set to True if you always want to download, regardless of local copy
+        #                                     local_files_only=False,  # Set to False to allow downloading if not available locally
+        #                                     local_dir_use_symlinks="auto") # or set to True/False based on your symlink preference
+        self.model_path = files_for_uform_gen2_qwen
+        print("Model path:", self.model_path)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = AutoModel.from_pretrained(self.model_path, trust_remote_code=True).to(self.device)
+        self.processor = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
+
+    def chat_response(self, message, history, image_path):
+        stop = StopOnTokens()
+        messages = [{"role": "system", "content": "You are a helpful Assistant."}]
+
+        for user_msg, assistant_msg in history:
+            messages.append({"role": "user", "content": user_msg})
+            messages.append({"role": "assistant", "content": assistant_msg})
+
+        if len(messages) == 1:
+            message = f" <image>{message}"
+
+        messages.append({"role": "user", "content": message})
+
+        model_inputs = self.processor.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt"
+        )
+
+        image = Image.open(image_path)  # Load image using PIL
+        image_tensor = (
+            self.processor.feature_extractor(image)
+            .unsqueeze(0)
+        )
+
+        attention_mask = torch.ones(
+            1, model_inputs.shape[1] + self.processor.num_image_latents - 1
+        )
+
+        model_inputs = {
+            "input_ids": model_inputs,
+            "images": image_tensor,
+            "attention_mask": attention_mask
+        }
+
+        model_inputs = {k: v.to(self.device) for k, v in model_inputs.items()}
+
+        with torch.inference_mode():
+            output = self.model.generate(
+                **model_inputs,
+                max_new_tokens=512,
+                do_sample=True,
+                temperature=0.3,
+                repetition_penalty=1.2,
+                stopping_criteria=StoppingCriteriaList([stop])
+            )
+
+        response_text = self.processor.tokenizer.decode(output[0], skip_special_tokens=True)
+        response_text = remove_duplicate_string(response_text)
+        return response_text
+
 '''CLASS'''
 
 class AnyType(str):
   """A special class that is always equal in not equal comparisons. Credit to pythongosssss"""
+  def __eq__(self, __value: object) -> bool:
+    return True
   def __ne__(self, __value: object) -> bool:
     return False
 
@@ -1800,3 +2219,51 @@ gemini_safety_settings = [
         "threshold": "BLOCK_NONE"
     }
 ]
+
+minicpm_llama3_v25_prompts = """
+        # MISSION
+        You are an imagine generator for a slide deck tool. You will be given the text or description of a slide and you'll generate a few image descriptions that will be fed to an AI image generator. It will need to have a particular format (seen below). You will also be given some examples below. Think metaphorically and symbolically. 
+
+        # FORMAT
+        The format should follow this general pattern:
+
+        <MAIN SUBJECT>, <DESCRIPTION OF MAIN SUBJECT>, <BACKGROUND OR CONTEXT, LOCATION, ETC>, <STYLE, GENRE, MOTIF, ETC>, <COLOR SCHEME>, <CAMERA DETAILS>
+
+        It's not strictly required, as you'll see below, you can pick and choose various aspects, but this is the general order of operations
+
+        # EXAMPLES
+
+        a Shakespeare stage play, yellow mist, atmospheric, set design by Michel Crête, Aerial acrobatics design by André Simard, hyperrealistic, 4K, Octane render, unreal engine
+
+        The Moon Knight dissolving into swirling sand, volumetric dust, cinematic lighting, close up portrait
+
+        ethereal Bohemian Waxwing bird, Bombycilla garrulus :: intricate details, ornate, detailed illustration, octane render :: Johanna Rupprecht style, William Morris style :: trending on artstation
+
+        steampunk cat, octane render, hyper realistic
+
+        Hyper detailed movie still that fuses the iconic tea party scene from Alice in Wonderland showing the hatter and an adult alice. a wooden table is filled with teacups and cannabis plants. The scene is surrounded by flying weed. Some playcards flying around in the air. Captured with a Hasselblad medium format camera
+
+        venice in a carnival picture 3, in the style of fantastical compositions, colorful, eye-catching compositions, symmetrical arrangements, navy and aquamarine, distinctive noses, gothic references, spiral group –style expressive
+
+        Beautiful and terrifying Egyptian mummy, flirting and vamping with the viewer, rotting and decaying climbing out of a sarcophagus lunging at the viewer, symmetrical full body Portrait photo, elegant, highly detailed, soft ambient lighting, rule of thirds, professional photo HD Photography, film, sony, portray, kodak Polaroid 3200dpi scan medium format film Portra 800, vibrantly colored portrait photo by Joel – Peter Witkin + Diane Arbus + Rhiannon + Mike Tang, fashion shoot
+
+        A grandmotherly Fate sits on a cozy cosmic throne knitting with mirrored threads of time, the solar system spins like clockwork behind her as she knits the futures of people together like an endless collage of destiny, maximilism, cinematic quality, sharp – focus, intricate details
+
+        A cloud with several airplanes flying around on top, in the style of detailed fantasy art, nightcore, quiet moments captured in paint, radiant clusters, i cant believe how beautiful this is, detailed character design, dark cyan and light crimson
+
+        An incredibly detailed close up macro beauty photo of an Asian model, hands holding a bouquet of pink roses, surrounded by scary crows from hell. Shot on a Hasselblad medium format camera with a 100mm lens. Unmistakable to a photograph. Cinematic lighting. Photographed by Tim Walker, trending on 500px
+
+        Game-Art | An island with different geographical properties and multiple small cities floating in space ::10 Island | Floating island in space – waterfalls over the edge of the island falling into space – island fragments floating around the edge of the island, Mountain Ranges – Deserts – Snowy Landscapes – Small Villages – one larger city ::8 Environment | Galaxy – in deep space – other universes can be seen in the distance ::2 Style | Unreal Engine 5 – 8K UHD – Highly Detailed – Game-Art
+
+        a warrior sitting on a giant creature and riding it in the water, with wings spread wide in the water, camera positioned just above the water to capture this beautiful scene, surface showing intricate details of the creature’s scales, fins, and wings, majesty, Hero rides on the creature in the water, digitally enhanced, enhanced graphics, straight, sharp focus, bright lighting, closeup, cinematic, Bronze, Azure, blue, ultra highly detailed, 18k, sharp focus, bright photo with rich colors, full coverage of a scene, straight view shot
+
+        A real photographic landscape painting with incomparable reality,Super wide,Ominous sky,Sailing boat,Wooden boat,Lotus,Huge waves,Starry night,Harry potter,Volumetric lighting,Clearing,Realistic,James gurney,artstation
+
+        Tiger monster with monstera plant over him, back alley in Bangkok, art by Otomo Katsuhiro crossover Yayoi Kusama and Hayao Miyazaki
+
+        An elderly Italian woman with wrinkles, sitting in a local cafe filled with plants and wood decorations, looking out the window, wearing a white top with light purple linen blazer, natural afternoon light shining through the window
+
+        # OUTPUT
+        Your output should just be an plain list of descriptions. No numbers, no extraneous labels, no hyphens.
+        Create only one prompt.
+        """
